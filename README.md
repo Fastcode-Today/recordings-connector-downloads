@@ -3,7 +3,26 @@
 This public repository distributes verified installation bundles for Fastvoice
 Recordings Connector. It does not contain the connector source code.
 
-Use the assets attached to a release:
+Install on Linux/WSL using the permanent public entry point (Docker Compose V2,
+Bash, curl, sha256sum and flock required):
+
+```bash
+curl -fsSL https://callcenter.fastcode.today/install/recordings-connector | bash
+cd recordings-connector
+```
+
+Edit only the token and destination in `.env`, then run `docker compose up -d`.
+Update using `./connector update`. For an older installation without the launcher,
+run this from its existing directory:
+
+```bash
+curl -fsSL https://callcenter.fastcode.today/install/recordings-connector | bash -s -- --upgrade
+```
+
+The installer resolves and verifies the approved version internally; users do not
+copy versions or hashes. Existing `.env`, recordings and SQLite are preserved.
+
+Alternatively, use the assets attached to a release:
 
 - `recordings-connector-<version>.zip`
 - `SHA256SUMS`
