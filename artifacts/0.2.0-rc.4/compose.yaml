@@ -1,0 +1,36 @@
+services:
+  connector:
+    image: ghcr.io/fastcode-today/recordings-connector:0.2.0-rc.4@sha256:121e1a0de4454bc8c5f3190b5971dcf4c2b61b106d934346b378ec6a887c350d
+    command: [run]
+    restart: 'on-failure:5'
+    init: true
+    stop_grace_period: 45s
+    environment:
+      FASTVOICE_ENV_FILE: /run/connector/config.env
+      STATE_DIR: /state
+      RECORDINGS_DIR: /recordings
+    volumes:
+      - connector-state:/state
+      - type: bind
+        source: ${RECORDINGS_PATH:?Set RECORDINGS_PATH in .env}
+        target: /recordings
+      - type: bind
+        source: ./.env
+        target: /run/connector.env
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /run/connector:rw,noexec,nosuid,size=65536,mode=0700
+    read_only: true
+    cap_drop: [ALL]
+    # Docker init must forward SIGTERM to the service after its UID changes.
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID, SETPCAP, KILL]
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+volumes:
+  connector-state:
