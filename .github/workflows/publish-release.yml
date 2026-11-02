@@ -19,7 +19,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - name: Validate source-free release assets
+      - name: Validate public installer assets
         id: release
         shell: bash
         run: |
@@ -64,12 +64,19 @@ jobs:
             prerelease=(--prerelease)
           fi
 
+          update_assets=()
+          if [[ -f "$DIRECTORY/connector" ]]; then
+            test -f "$DIRECTORY/update.env"
+            bash -n "$DIRECTORY/connector"
+            update_assets+=("$DIRECTORY/connector" "$DIRECTORY/update.env")
+          fi
           gh release create "$GITHUB_REF_NAME" \
             "$DIRECTORY/recordings-connector-$VERSION.zip" \
             "$DIRECTORY/SHA256SUMS" \
             "$DIRECTORY/compose.yaml" \
             "$DIRECTORY/env.example" \
             "$DIRECTORY/IMAGE_DIGEST.txt" \
+            "${update_assets[@]}" \
             --verify-tag \
             "${prerelease[@]}" \
             --title "Fastvoice Recordings Connector $VERSION" \

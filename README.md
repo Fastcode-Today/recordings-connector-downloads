@@ -18,3 +18,9 @@ The installer contains placeholders only. Configure `FASTVOICE_TOKEN` and
 Release candidates are pilots, not stable releases. No workflow promotes a
 candidate to stable or updates an installed container automatically.
 
+
+From rc.7, releases also include the public host launcher `connector` and its verified
+`update.env` manifest. Run `./connector update` on Linux/WSL to apply the latest
+approved pilot version. It preserves local configuration and data, and the service
+performs backups and migrations automatically. The channel is promoted only after
+an upgrade test passes; it is not a stable-release promotion or a background updater.
