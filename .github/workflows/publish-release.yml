@@ -1,0 +1,95 @@
+name: Publish verified installer
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-connector-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Validate source-free release assets
+        id: release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          directory="artifacts/$version"
+          zip="recordings-connector-$version.zip"
+
+          test -d "$directory"
+          for file in "$zip" SHA256SUMS compose.yaml env.example IMAGE_DIGEST.txt release-notes.md; do
+            test -f "$directory/$file"
+          done
+
+          (cd "$directory" && sha256sum --check SHA256SUMS)
+          unzip -t "$directory/$zip"
+          test "$(od -An -tx1 -N2 "$directory/$zip" | tr -d ' \n')" = '504b'
+          test "$(sed -n '1p' "$directory/env.example")" = 'FASTVOICE_TOKEN=PEGUE_SU_TOKEN'
+          test "$(sed -n '2p' "$directory/env.example")" = 'RECORDINGS_PATH=./recordings'
+          test "$(wc -l < "$directory/env.example" | tr -d ' ')" = '2'
+          grep -Eq "image: ghcr\.io/fastcode-today/recordings-connector:$version@sha256:[a-f0-9]{64}$" "$directory/compose.yaml"
+          test "$(cat "$directory/IMAGE_DIGEST.txt")" = "$(sed -nE 's/.*@(sha256:[a-f0-9]{64})/\1/p' "$directory/compose.yaml")"
+
+          if grep -RIE '(Bearer[[:space:]]+[A-Za-z0-9._-]{16,}|AKIA[A-Z0-9]{16}|-----BEGIN .*PRIVATE KEY-----)' "$directory"; then
+            echo 'Release assets contain a credential-like value.' >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "directory=$directory" >> "$GITHUB_OUTPUT"
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+
+      - name: Create immutable public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          DIRECTORY: ${{ steps.release.outputs.directory }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+
+          gh release create "$GITHUB_REF_NAME" \
+            "$DIRECTORY/recordings-connector-$VERSION.zip" \
+            "$DIRECTORY/SHA256SUMS" \
+            "$DIRECTORY/compose.yaml" \
+            "$DIRECTORY/env.example" \
+            "$DIRECTORY/IMAGE_DIGEST.txt" \
+            --verify-tag \
+            "${prerelease[@]}" \
+            --title "Fastvoice Recordings Connector $VERSION" \
+            --notes-file "$DIRECTORY/release-notes.md"
+
+      - name: Verify anonymous download is a ZIP, not HTML
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          ZIP_NAME: ${{ steps.release.outputs.zip }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          unset GH_TOKEN GITHUB_TOKEN
+          base="https://github.com/Fastcode-Today/recordings-connector-downloads/releases/download/v$VERSION"
+          mkdir -p /tmp/public-installer
+          curl --fail --location --retry 5 --retry-all-errors \
+            "$base/$ZIP_NAME" --output "/tmp/public-installer/$ZIP_NAME"
+          curl --fail --location --retry 5 --retry-all-errors \
+            "$base/SHA256SUMS" --output /tmp/public-installer/SHA256SUMS
+          test "$(od -An -tx1 -N2 "/tmp/public-installer/$ZIP_NAME" | tr -d ' \n')" = '504b'
+          file "/tmp/public-installer/$ZIP_NAME" | grep -q 'Zip archive data'
+          unzip -t "/tmp/public-installer/$ZIP_NAME"
+          (cd /tmp/public-installer && grep " $ZIP_NAME$" SHA256SUMS | sha256sum --check -)
