@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+# Host launcher: no Docker socket is mounted in the recording service.
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+fail() { printf 'Error: %s\n' "$1" >&2; exit 1; }
+fetch() { curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 "$1" --output "$2"; }
+value() { local count; count=$(awk -F= -v key="$1" '$1==key {n++} END {print n+0}' "$2"); [[ "$count" == 1 ]] || fail 'Invalid release manifest'; awk -F= -v key="$1" '$1==key {print substr($0,length(key)+2)}' "$2"; }
+phase() { printf '%s\n' "$1" > "$STAGE/phase.next"; mv "$STAGE/phase.next" "$STAGE/phase"; }
+compose() {
+  local file=$1; shift
+  local args=(--project-directory "$ROOT" --env-file "$ROOT/.env" -f "$file")
+  if [[ -f "$ROOT/compose.override.yaml" ]]; then args+=(-f "$ROOT/compose.override.yaml"); fi
+  docker compose "${args[@]}" "$@"
+}
+running_image() {
+  local id; id=$(compose "$ROOT/compose.yaml" ps --quiet connector)
+  [[ -n "$id" && "$id" != *$'\n'* ]] || return 1
+  docker inspect --format '{{.Config.Image}}' "$id"
+}
+verify() {
+  [[ "$(value FORMAT "$STAGE/update.env")" == 1 ]] || fail 'Unsupported update manifest'
+  VERSION=$(value VERSION "$STAGE/update.env")
+  DIGEST=$(value IMAGE_DIGEST "$STAGE/update.env")
+  [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.-]+)?$ ]] || fail 'Invalid version'
+  [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || fail 'Invalid image digest'
+  for name in compose.yaml connector; do
+    local key expected actual
+    if [[ "$name" == compose.yaml ]]; then key=COMPOSE_SHA256; else key=LAUNCHER_SHA256; fi
+    expected=$(value "$key" "$STAGE/update.env")
+    [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || fail 'Invalid checksum'
+    actual=$(sha256sum "$STAGE/$name"); actual=${actual%% *}
+    [[ "$actual" == "$expected" ]] || fail 'Downloaded release checksum mismatch'
+  done
+  IMAGE="ghcr.io/fastcode-today/recordings-connector:$VERSION@$DIGEST"
+  grep -Fxq "    image: $IMAGE" "$STAGE/compose.yaml" || fail 'Compose does not match release image'
+}
+main() {
+  [[ "${1:-}" == update && $# -le 2 ]] || fail 'Usage: ./connector update [version]'
+  cd "$ROOT"
+  for cmd in docker curl sha256sum flock awk; do command -v "$cmd" >/dev/null || fail "Missing dependency: $cmd"; done
+  docker compose version >/dev/null
+  [[ -f .env && -f compose.yaml && ! -L compose.yaml && ! -L .connector ]] || fail 'Run inside the existing installation with .env and compose.yaml'
+  mkdir -p .connector; chmod 700 .connector
+  exec 9>.connector/update.lock
+  flock -n 9 || fail 'Another update is in progress'
+  if [[ -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
+    local projects
+    projects=$(docker ps -a --filter "label=com.docker.compose.project.working_dir=$ROOT" --filter 'label=com.docker.compose.service=connector' --format '{{.Label "com.docker.compose.project"}}' | sort -u)
+    if [[ -n "$projects" ]]; then
+      [[ "$projects" != *$'\n'* && "$projects" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || fail 'Multiple projects found; set COMPOSE_PROJECT_NAME to the existing installation'
+      export COMPOSE_PROJECT_NAME="$projects"
+    fi
+  fi
+  STAGE="$ROOT/.connector/pending"
+  trap 'rc=$?; if ((rc)); then printf "Update incomplete. Data and .env preserved. Retry: ./connector update\n" >&2; fi' EXIT
+  if [[ ! -d "$STAGE" ]]; then
+    local work version base
+    work=$(mktemp -d "$ROOT/.connector/download.XXXXXX")
+    if [[ $# == 2 ]]; then version=$2
+    else
+      fetch "https://raw.githubusercontent.com/Fastcode-Today/recordings-connector-downloads/main/channels/pilot.env?check=$RANDOM-$$" "$work/channel"
+      version=$(value VERSION "$work/channel")
+    fi
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.-]+)?$ ]] || fail 'Invalid approved version'
+    base="https://github.com/Fastcode-Today/recordings-connector-downloads/releases/download/v$version"
+    for name in update.env compose.yaml connector; do fetch "$base/$name" "$work/$name"; done
+    if [[ $# == 1 ]]; then
+      local expected actual
+      expected=$(value MANIFEST_SHA256 "$work/channel")
+      [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || fail 'Invalid channel checksum'
+      actual=$(sha256sum "$work/update.env"); actual=${actual%% *}
+      [[ "$actual" == "$expected" ]] || fail 'Channel manifest checksum mismatch'
+    fi
+    STAGE=$work; verify
+    [[ "$VERSION" == "$version" ]] || fail 'Release version mismatch'
+    local env_sha; env_sha=$(sha256sum "$ROOT/.env"); env_sha=${env_sha%% *}
+    if [[ -f "$ROOT/.connector/installed-env.sha256" ]] && [[ "$(cat "$ROOT/.connector/installed-env.sha256")" == "$env_sha" ]] && [[ -f "$ROOT/.connector/installed-version" ]] && [[ "$(cat "$ROOT/.connector/installed-version")" == "$VERSION" ]] && cmp -s "$ROOT/compose.yaml" "$STAGE/compose.yaml" && [[ "$(running_image)" == "$IMAGE" ]] && compose "$ROOT/compose.yaml" exec -T connector node dist/src/cli.js health >/dev/null 2>&1; then
+      rm -rf "$work"; printf 'Already current: %s.\n' "$VERSION"; return
+    fi
+    # Complete all download/validation work while the old service is still running.
+    compose "$STAGE/compose.yaml" config --quiet
+    compose "$STAGE/compose.yaml" config --images | grep -Fx "$IMAGE" >/dev/null || fail 'An override changes the release image'
+    compose "$STAGE/compose.yaml" pull connector
+    compose "$STAGE/compose.yaml" run --rm --no-deps connector preflight
+    cp -p compose.yaml "$STAGE/previous-compose.yaml"
+    phase prepared
+    mv "$STAGE" "$ROOT/.connector/pending"; STAGE="$ROOT/.connector/pending"
+  fi
+  verify
+  local current; current=$(cat "$STAGE/phase")
+  case "$current" in
+    prepared)
+      compose "$ROOT/compose.yaml" stop connector
+      phase stopped
+      ;;
+    stopped|installed|running) ;;
+    *) fail 'Unknown update phase; preserve .connector/pending for diagnosis' ;;
+  esac
+  cp "$STAGE/compose.yaml" "$ROOT/.connector/compose.next"
+  mv "$ROOT/.connector/compose.next" "$ROOT/compose.yaml"
+  if [[ "$(cat "$STAGE/phase")" == stopped ]]; then phase installed; fi
+  if [[ "$(cat "$STAGE/phase")" == installed ]]; then
+    compose "$ROOT/compose.yaml" up -d --no-deps --force-recreate connector
+    phase running
+  else
+    compose "$ROOT/compose.yaml" up -d --no-deps connector
+  fi
+  printf 'Waiting for automatic backup, migrations and health checks...\n'
+  local ready=0
+  for ((attempt=0;attempt<900;attempt++)); do
+    if compose "$ROOT/compose.yaml" exec -T connector node dist/src/cli.js health >/dev/null 2>&1; then ready=1; break; fi
+    if ! compose "$ROOT/compose.yaml" ps --status running --quiet connector | grep -q .; then
+      fail 'Connector stopped during update; inspect docker compose logs connector and retry'
+    fi
+    sleep 2
+  done
+  [[ "$ready" == 1 ]] || fail 'Migration/health timeout; process preserved. Retry the same command to wait/resume'
+  [[ "$(running_image)" == "$IMAGE" ]] || fail 'Running container does not match the validated image'
+  compose "$ROOT/compose.yaml" run --rm --no-deps connector status
+  cp "$STAGE/connector" "$ROOT/.connector/launcher.next"; chmod 700 "$ROOT/.connector/launcher.next"
+  mv "$ROOT/.connector/launcher.next" "$ROOT/connector"
+  printf '%s\n' "$VERSION" > "$ROOT/.connector/installed-version.next"
+  mv "$ROOT/.connector/installed-version.next" "$ROOT/.connector/installed-version"
+  local env_sha; env_sha=$(sha256sum "$ROOT/.env"); env_sha=${env_sha%% *}
+  printf '%s\n' "$env_sha" > "$ROOT/.connector/installed-env.sha256.next"
+  mv "$ROOT/.connector/installed-env.sha256.next" "$ROOT/.connector/installed-env.sha256"
+  # Keep a bounded history of Compose, not credentials or recording data.
+  cp "$STAGE/previous-compose.yaml" "$ROOT/.connector/previous-compose.yaml"
+  rm -rf "$STAGE"
+  printf 'Update completed: %s. Audio, metadata and SQLite preserved.\n' "$VERSION"
+}
+main "$@"
